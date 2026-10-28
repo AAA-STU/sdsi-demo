@@ -57,6 +57,10 @@ export interface MasterOptions {
   cwd: string;
   /** Model id for the Master (the deep-thinking model). */
   model: string;
+  /** Run-scoped settings.json (model ids + OpenAI API key) for this run. */
+  settingsPath?: string;
+  /** Aborting this signal stops in-flight CLI calls when the run is stopped. */
+  signal?: AbortSignal;
   log?: LogFn;
 }
 
@@ -70,12 +74,16 @@ export class Master {
   private readonly cliPath: string;
   private readonly cwd: string;
   private readonly model: string;
+  private readonly settingsPath: string | undefined;
+  private readonly signal: AbortSignal | undefined;
   private readonly log: LogFn;
 
   constructor(options: MasterOptions) {
     this.cliPath = options.cliPath;
     this.cwd = options.cwd;
     this.model = options.model;
+    this.settingsPath = options.settingsPath;
+    this.signal = options.signal;
     this.log = options.log ?? (() => undefined);
 
     if (!this.model || !this.model.trim()) {
@@ -119,6 +127,8 @@ export class Master {
       cliPath: this.cliPath,
       cwd: this.cwd,
       model: this.model,
+      settingsPath: this.settingsPath,
+      signal: this.signal,
       prompt,
       system,
       log: this.log,
@@ -161,12 +171,14 @@ export class Master {
       cliPath: this.cliPath,
       cwd: this.cwd,
       model: this.model,
+      settingsPath: this.settingsPath,
       role: 'master',
       prompt,
       system,
       tools: REVIEW_TOOLS,
       allowedTools: [],
       timeoutMs: 10 * 60 * 1000,
+      signal: this.signal,
       log: this.log,
     });
 
@@ -238,6 +250,8 @@ async function runPlan(options: {
   cliPath: string;
   cwd: string;
   model: string;
+  settingsPath?: string;
+  signal?: AbortSignal;
   prompt: string;
   system: string;
   log?: LogFn;
@@ -246,6 +260,7 @@ async function runPlan(options: {
     cliPath: options.cliPath,
     cwd: options.cwd,
     model: options.model,
+    settingsPath: options.settingsPath,
     role: 'master',
     prompt: options.prompt,
     system: options.system,
@@ -253,6 +268,7 @@ async function runPlan(options: {
     allowedTools: [],
     jsonSchema: PLAN_SCHEMA,
     timeoutMs: 15 * 60 * 1000,
+    signal: options.signal,
     log: options.log,
   });
 }

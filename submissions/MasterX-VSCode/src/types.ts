@@ -47,9 +47,6 @@ export type LogFn = (message: string, level: LogLevel) => void;
 /** Progress stages shown in the webview tracker. */
 export type StageId = 'indexing' | 'planning' | 'executing' | 'completed' | 'error';
 
-/** Per-task execution status shown in the webview task list. */
-export type TaskStatus = 'pending' | 'running' | 'done' | 'failed';
-
 /** One model id plus a human-readable note about where it came from. */
 export interface ResolvedModel {
   model: string;
@@ -67,6 +64,13 @@ export interface MasterXConfig {
   master: ResolvedModel;
   /** Lightweight role: indexes the codebase and drafts code and commands. */
   worker: ResolvedModel;
+  /**
+   * OpenAI API key used to list the available models and to authenticate the
+   * CLI run (written into the run-scoped settings.json).
+   */
+  openAiApiKey: string;
+  /** Endpoint that returns the list of selectable models. */
+  modelListUrl: string;
 }
 
 /** Result of reading settings + environment + ~/.claude/settings.json. */
@@ -78,12 +82,12 @@ export interface ConfigLoadResult {
 
 /** Shape of the message envelope shared with the webview. */
 export type WebviewOutboundMessage =
-  | { type: 'init'; masterModel: string; workerModel: string; workspaceFolder: string }
+  | { type: 'init'; masterModel: string; workerModel: string }
   | { type: 'log'; message: string; level: LogLevel }
   | { type: 'stage'; stage: StageId; detail: string }
-  | { type: 'subtasks'; tasks: Array<Pick<SubTask, 'id' | 'action' | 'targetPath'>> }
-  | { type: 'task'; id: string; status: TaskStatus; detail: string }
   | { type: 'summary'; text: string }
+  | { type: 'models'; models: string[] }
+  | { type: 'user-input'; text: string }
   | { type: 'busy'; value: boolean }
   | { type: 'reset' }
   | { type: 'focus-input' }
@@ -92,4 +96,7 @@ export type WebviewOutboundMessage =
 export type WebviewInboundMessage =
   | { type: 'ready' }
   | { type: 'execute'; goal: string }
-  | { type: 'reset' };
+  | { type: 'reset' }
+  | { type: 'stop' }
+  | { type: 'set-model'; role: 'master' | 'worker'; model: string }
+  | { type: 'custom-model'; role: 'master' | 'worker' };

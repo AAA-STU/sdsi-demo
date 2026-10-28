@@ -45,10 +45,17 @@ export interface ClaudeCliRunOptions {
   allowedTools?: string[];
   /** Permission mode for the session. */
   permissionMode?: string;
+  /**
+   * Run-scoped settings.json merged over ~/.claude/settings.json. Carries the
+   * model ids chosen in the dropdowns and the OpenAI API key for the run.
+   */
+  settingsPath?: string;
   /** When set, `--json-schema` is passed and the parsed result is validated. */
   jsonSchema?: Record<string, unknown>;
   /** Milliseconds before the CLI is killed (default 15 minutes). */
   timeoutMs?: number;
+  /** Aborting this signal kills the CLI process and raises a "stopped" error. */
+  signal?: AbortSignal;
   log?: LogFn;
 }
 
@@ -132,13 +139,28 @@ export async function runClaudeCli(options: ClaudeCliRunOptions): Promise<Claude
   let stderr = '';
   let captured = 0;
 
+  const signal = options.signal;
+  if (signal?.aborted) {
+    throw new ClaudeCliError(`${roleLabel}: run stopped by user.`);
+  }
+
   const exit = await new Promise<number>((resolve, reject) => {
     const child = spawn(cliPath, args, {
       cwd: options.cwd,
       windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       // shell:false — the executable is a real .exe, never a shell script.
     });
+
+    // The prompt is delivered over stdin rather than as a positional argument:
+    // command lines are length-capped (≈32k chars on Windows) and index-update
+    // prompts embed the whole existing `.masterx` index. `claude --print` reads
+    // the user prompt from stdin when none is passed on the command line.
+    child.stdin.on('error', () => {
+      // EPIPE when the CLI exits before consuming stdin is harmless here —
+      // the exit path below reports the real outcome.
+    });
+    child.stdin.end(options.prompt);
 
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
@@ -156,7 +178,19 @@ export async function runClaudeCli(options: ClaudeCliRunOptions): Promise<Claude
       }
     });
 
+    const onAbort = () => {
+      child.kill('SIGKILL');
+      reject(new ClaudeCliError(`${roleLabel}: run stopped by user.`));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+
     const timer = setTimeout(() => {
+      cleanup();
       child.kill('SIGKILL');
       reject(
         new ClaudeCliError(
@@ -166,12 +200,12 @@ export async function runClaudeCli(options: ClaudeCliRunOptions): Promise<Claude
     }, timeoutMs);
 
     child.on('error', (error) => {
-      clearTimeout(timer);
+      cleanup();
       reject(new ClaudeCliError(`${roleLabel}: failed to launch Claude CLI: ${error.message}`, undefined, undefined, error));
     });
 
     child.on('close', (code) => {
-      clearTimeout(timer);
+      cleanup();
       resolve(code ?? 1);
     });
   });
@@ -245,6 +279,12 @@ export function buildArgs(options: ClaudeCliRunOptions): string[] {
     '--no-session-persistence',
   ];
 
+  // Run-scoped settings: the model ids and the OpenAI API key selected in the
+  // MasterX UI, merged over ~/.claude/settings.json by the CLI itself.
+  if (options.settingsPath && options.settingsPath.trim()) {
+    args.push('--settings', options.settingsPath.trim());
+  }
+
   if (options.system) {
     args.push('--system-prompt', options.system);
   }
@@ -270,7 +310,9 @@ export function buildArgs(options: ClaudeCliRunOptions): string[] {
     args.push('--json-schema', JSON.stringify(options.jsonSchema));
   }
 
-  args.push('--', options.prompt);
+  // The prompt itself is intentionally absent from the command line: it is
+  // written to the child's stdin (see runClaudeCli). Command lines are capped
+  // (≈32k chars on Windows) and index prompts routinely exceed that.
   return args;
 }
 

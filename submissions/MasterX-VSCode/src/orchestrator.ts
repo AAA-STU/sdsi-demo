@@ -4,12 +4,12 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { Master } from './master';
 import { Worker } from './worker';
+import { clearChanges, loadIndexState, writeChanges, writeIndex } from './indexer';
 import {
   LogFn,
   StageId,
   SubTask,
   TaskResult,
-  TaskStatus,
 } from './types';
 
 /** How many files the Worker sees listed during indexing. */
@@ -49,8 +49,6 @@ const TEXT_FILENAMES = new Set([
 export interface OrchestratorHooks {
   onLog: LogFn;
   onStage: (stage: StageId, detail: string) => void;
-  onSubtasks: (tasks: SubTask[]) => void;
-  onTask: (id: string, status: TaskStatus, detail: string) => void;
   onSummary: (text: string) => void;
 }
 
@@ -66,12 +64,15 @@ interface CommandOutcome {
 }
 
 /**
- * The 3-stage lifecycle that ties the pipeline together:
- *   1. Worker scans the workspace and writes a dense architectural summary.
+ * The 4-stage lifecycle that ties the pipeline together:
+ *   1. Scout: checks `.masterx/` before reading source, then builds or updates
+ *      the hierarchical index (index.md HLD + docs/*.md LLD) and writes a dense
+ *      architectural summary.
  *   2. Master turns the summary + goal into a strict JSON execution plan.
  *   3. Worker executes every task (files written via workspace.fs, commands run
  *      in a VS Code terminal with captured output).
- *   4. Master synthesizes the final report from the execution results.
+ *   4. Master synthesizes the final report and records source changes in
+ *      `.masterx/changes.md` so the next Scout can update the indexes.
  *
  * Every step reports through the streaming hooks so the webview stays live.
  */
@@ -83,22 +84,49 @@ export class Orchestrator {
   ) {}
 
   /** Run the full lifecycle for one goal. Never throws; failures are reported. */
-  async run(goal: string): Promise<void> {
+  async run(goal: string, signal?: AbortSignal): Promise<void> {
     const results: TaskResult[] = [];
 
     try {
-      // ---- Stage 1: Worker indexes the codebase -----------------------------
-      this.hooks.onStage('indexing', 'Worker indexing codebase…');
-      this.hooks.onLog('Stage 1/4 — Worker: scanning workspace files…', 'info');
+      // ---- Stage 1: Scout indexes the codebase -----------------------------
+      // The `.masterx` check happens first of all, before any source is read:
+      // an existing index is updated from the recorded changes instead of
+      // being regenerated from a full scan.
+      const root = this.requireWorkspaceRoot().uri.fsPath;
+      const indexState = await loadIndexState(root);
+      this.hooks.onStage(
+        'indexing',
+        indexState.exists ? 'Updating .masterx hierarchical index…' : 'Building .masterx hierarchical index…'
+      );
+      this.hooks.onLog(
+        indexState.exists
+          ? 'Stage 1/4 — Worker: .masterx index found — updating it from pending changes.'
+          : 'Stage 1/4 — Worker: no .masterx index — scanning workspace files…',
+        'info'
+      );
 
-      const scan = await this.scanWorkspace();
+      const scan = await this.scanWorkspace(
+        indexState.exists ? changedPathsFrom(indexState.changesMd) : undefined
+      );
       this.hooks.onLog(
         `Workspace scan: ${scan.fileList.length} file(s) listed, sampled content ${scan.sampleContents.length} chars.`,
         'debug'
       );
 
-      const summary = await this.worker.indexAndSummarize(goal, scan.fileList, scan.sampleContents);
+      const { summary, index } = await this.worker.indexAndSummarize(
+        goal,
+        scan.fileList,
+        scan.sampleContents,
+        indexState
+      );
       this.hooks.onLog(`Worker summary ready (${summary.length} chars).`, 'success');
+
+      const written = await writeIndex(root, index);
+      this.hooks.onLog(`Index written: ${written.join(', ')}`, 'success');
+      if (indexState.exists && indexState.changesMd.trim()) {
+        await clearChanges(root);
+        this.hooks.onLog('Pending changes incorporated; .masterx/changes.md cleared.', 'debug');
+      }
 
       // ---- Stage 2: Master plans -------------------------------------------
       this.hooks.onStage('planning', 'Master thinking & planning…');
@@ -109,8 +137,6 @@ export class Orchestrator {
       if (plan.thought.trim()) {
         this.hooks.onLog(`Master reasoning: ${plan.thought.trim()}`, 'debug');
       }
-      this.hooks.onSubtasks(plan.tasks);
-
       if (plan.tasks.length === 0) {
         this.hooks.onLog('Master produced an empty plan; nothing to execute.', 'warn');
       }
@@ -120,16 +146,26 @@ export class Orchestrator {
       this.hooks.onLog('Stage 3/4 — Worker: executing plan tasks…', 'info');
 
       for (const task of plan.tasks) {
-        this.hooks.onTask(task.id, 'running', task.targetPath);
+        if (signal?.aborted) {
+          this.hooks.onLog('Stop requested — skipping the remaining tasks.', 'warn');
+          break;
+        }
         try {
-          const result = await this.executeOne(task);
+          const result = await this.executeOne(task, signal);
           results.push(result);
-          if (result.success) {
-            this.hooks.onTask(task.id, 'done', result.output.split('\n')[0] ?? 'done');
-          } else {
-            this.hooks.onTask(task.id, 'failed', result.error ?? 'failed');
-          }
         } catch (error) {
+          if (signal?.aborted) {
+            results.push({
+              taskId: task.id,
+              action: task.action,
+              targetPath: task.targetPath,
+              success: false,
+              output: '',
+              error: 'Stopped by user.',
+            });
+            this.hooks.onLog(`Task ${task.id} stopped.`, 'warn');
+            break;
+          }
           const message = error instanceof Error ? error.message : String(error);
           results.push({
             taskId: task.id,
@@ -139,34 +175,54 @@ export class Orchestrator {
             output: '',
             error: message,
           });
-          this.hooks.onTask(task.id, 'failed', message);
           this.hooks.onLog(`Task ${task.id} failed: ${message}`, 'error');
         }
+      }
+
+      if (signal?.aborted) {
+        // Record whatever was already executed so the next Scout run can
+        // bring the index up to date even after a stop.
+        await writeChanges(root, buildChangesDoc(goal, results));
+        this.reportStopped();
+        return;
       }
 
       const okCount = results.filter((r) => r.success).length;
       this.hooks.onLog(`Execution finished: ${okCount}/${results.length} task(s) succeeded.`, okCount === results.length ? 'success' : 'warn');
 
-      // ---- Stage 4: Master synthesizes ------------------------------------
-      this.hooks.onStage('completed', 'Master writing final report…');
-      this.hooks.onLog('Stage 4/4 — Master: synthesizing final report…', 'info');
+      // ---- Stage 4: Master verifies & synthesizes --------------------------
+      this.hooks.onStage('completed', 'Master verifying & writing final report…');
+      this.hooks.onLog('Stage 4/4 — Master: verifying and synthesizing final report…', 'info');
+
+      await writeChanges(root, buildChangesDoc(goal, results));
+      this.hooks.onLog('Recorded source changes in .masterx/changes.md.', 'debug');
 
       const report = await this.master.synthesize(goal, results);
       this.hooks.onSummary(report);
       this.hooks.onLog('Final report ready.', 'success');
     } catch (error) {
+      if (signal?.aborted) {
+        this.reportStopped();
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       this.hooks.onLog(message, 'error');
       this.hooks.onStage('error', message);
     }
   }
 
+  /** Report a user-initiated stop without treating it as a pipeline failure. */
+  private reportStopped(): void {
+    this.hooks.onLog('Run stopped by user.', 'warn');
+    this.hooks.onStage('error', 'Stopped by user.');
+  }
+
   /** Execute one Master-specified task and return its result. */
-  private async executeOne(task: SubTask): Promise<TaskResult> {
+  private async executeOne(task: SubTask, signal?: AbortSignal): Promise<TaskResult> {
     if (task.action === 'run_command') {
       const command = await this.worker.executeTask(task);
       this.hooks.onLog(`Running command (${task.id}): ${command}`, 'info');
-      const outcome = await this.runCommand(command, this.requireWorkspaceRoot().uri.fsPath);
+      const outcome = await this.runCommand(command, this.requireWorkspaceRoot().uri.fsPath, signal);
       if (outcome.success) {
         this.hooks.onLog(`Command completed (exit 0): ${command}`, 'success');
       } else {
@@ -225,7 +281,7 @@ export class Orchestrator {
    * output) while tee-ing the output to a temp log that this method reads back,
    * giving the pipeline a real exit code and stdout for the Master's review.
    */
-  private async runCommand(command: string, cwd: string): Promise<CommandOutcome> {
+  private async runCommand(command: string, cwd: string, signal?: AbortSignal): Promise<CommandOutcome> {
     const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const logFile = path.join(os.tmpdir(), `masterx-${stamp}.log`);
     const scriptFile = path.join(os.tmpdir(), `masterx-${stamp}.cmd`);
@@ -270,7 +326,8 @@ export class Orchestrator {
       return { success: false, output: '', error: `Failed to create command terminal: ${detail}` };
     }
 
-    terminal.show(true);
+    // The terminal is deliberately not revealed: the panel keeps showing the
+    // MasterX view while output is streamed into its console.
 
     // Fail fast if the terminal is closed before the command reports in.
     let closedEarly = false;
@@ -285,6 +342,13 @@ export class Orchestrator {
       let streamPos = 0;
 
       while (Date.now() < deadline) {
+        if (signal?.aborted) {
+          return {
+            success: false,
+            output: (readLogIfAny(logFile) ?? '').trim(),
+            error: 'Stopped by user.',
+          };
+        }
         await delay(COMMAND_POLL_MS);
 
         if (closedEarly && !fs.existsSync(logFile)) {
@@ -351,8 +415,12 @@ export class Orchestrator {
     }
   }
 
-  /** List workspace files and sample the contents of a few representative ones. */
-  private async scanWorkspace(): Promise<WorkspaceScan> {
+  /**
+   * List workspace files and sample the contents of a few representative ones.
+   * When `sampleFilter` is given (index-update mode) only those paths are
+   * sampled — the rest of the source stays unread.
+   */
+  private async scanWorkspace(sampleFilter?: string[]): Promise<WorkspaceScan> {
     const root = this.requireWorkspaceRoot();
 
     const uris = await vscode.workspace.findFiles(
@@ -376,13 +444,16 @@ export class Orchestrator {
       if (!isTextFile(uri.fsPath)) {
         continue;
       }
+      const relPath = path.relative(root.uri.fsPath, uri.fsPath).replace(/\\/g, '/');
+      if (sampleFilter && !sampleFilter.includes(relPath)) {
+        continue;
+      }
       try {
         const bytes = await vscode.workspace.fs.readFile(uri);
         const text = Buffer.from(bytes).toString('utf8');
         if (text.includes('\u0000')) {
           continue; // binary content
         }
-        const relPath = path.relative(root.uri.fsPath, uri.fsPath).replace(/\\/g, '/');
         const slice = text.slice(0, MAX_SAMPLE_CHARS);
         sampleParts.push(`--- ${relPath} ---\n${slice}`);
         budget -= slice.length;
@@ -448,4 +519,40 @@ function isTextFile(filePath: string): boolean {
 /** Quote a path for a POSIX shell word. */
 function quoteShell(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Build the `.masterx/changes.md` section recording one execution's source
+ * changes — a strict one-line entry per task so the next Scout run can pick
+ * up exactly what to re-index.
+ */
+function buildChangesDoc(goal: string, results: TaskResult[]): string {
+  const title = goal.trim().split(/\r?\n/)[0] || '(untitled goal)';
+  const lines = ['# Pending source changes', '', `## ${new Date().toISOString()} — ${title}`, ''];
+
+  for (const r of results) {
+    const target = `\`${r.targetPath}\``;
+    if (r.action === 'run_command') {
+      lines.push(`- command ${target}${r.success ? '' : ` (failed: ${r.error ?? 'unknown error'})`}`);
+    } else if (r.success) {
+      lines.push(`- ${r.action === 'create_file' ? 'created' : 'edited'} ${target}`);
+    } else {
+      lines.push(`- failed ${target} (${r.error ?? 'unknown error'})`);
+    }
+  }
+  if (results.length === 0) {
+    lines.push('- (no tasks were executed)');
+  }
+  return lines.join('\n');
+}
+
+/** Extract workspace paths recorded as created/edited in `.masterx/changes.md`. */
+function changedPathsFrom(changesMd: string): string[] {
+  const out: string[] = [];
+  const re = /^-\s+(?:created|edited)\s+`([^`]+)`/gm;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(changesMd)) !== null) {
+    out.push(match[1]);
+  }
+  return out;
 }

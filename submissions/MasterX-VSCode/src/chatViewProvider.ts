@@ -1,32 +1,48 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { claudeSettingsPath, loadConfig, validateConfig } from './configLoader';
+import { ModelCatalogError, ModelInfo, fetchModelList, preferChatModels } from './modelCatalog';
 import { Orchestrator } from './orchestrator';
 import { Master } from './master';
 import { Worker } from './worker';
+import { describeRunSettings, disposeRunSettings, writeRunSettings } from './runSettings';
 import {
   LogLevel,
   StageId,
-  SubTask,
-  TaskStatus,
   WebviewInboundMessage,
   WebviewOutboundMessage,
 } from './types';
 
+/** Which role a model dropdown is choosing for. */
+type ModelRole = 'master' | 'worker';
+
+/** Models chosen when the user picks the static "Auto" entry in the dropdowns. */
+const AUTO_MODELS: Record<ModelRole, string> = {
+  master: 'anthropic/claude-sonnet-5.5',
+  worker: 'xiaomi/mimo-v2.6-pro',
+};
+
+/** Resolve a dropdown selection to the model id actually used for a run. */
+function resolveModelId(role: ModelRole, model: string): string {
+  return model === 'Auto' ? AUTO_MODELS[role] : model;
+}
+
 /**
- * The MasterX sidebar panel: a self-contained vanilla HTML/CSS/JS webview using
- * only VS Code theme variables. No bundler, no framework.
+ * The MasterX panel: a self-contained vanilla HTML/CSS/JS webview using only
+ * VS Code theme variables. No bundler, no framework.
  *
- * Top:      status bar (Master model / Worker model)
- * Input:    goal textarea + Execute / Reset
- * Progress: 4-stage tracker + live task list
- * Console:  auto-scrolling log terminal
+ * Top:    auto-scrolling console (user goals, run logs, final report)
+ * Then:   stage stack — past and current stages, click one for its one-liner
+ * Then:   Master / Worker model dropdowns on a single line
+ * Bottom: goal chatbox with Execute / Stop / Reset, then the footer
  */
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'masterx.chatView';
 
   private view?: vscode.WebviewView;
   private running = false;
+  private abortController?: AbortController;
+  private catalog?: string[];
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -65,14 +81,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     webviewView.onDidDispose(() => {
       this.view = undefined;
     });
-
-    // Push resolved configuration as soon as the webview is ready for it.
-    this.postInit();
   }
 
   // ------------------------------------------------------------------- public
 
-  /** Focus the sidebar panel and reveal this view. */
+  /** Focus the panel and reveal this view. */
   focus(): void {
     void vscode.commands.executeCommand('masterx.chatView.focus');
     this.post({ type: 'focus-input' });
@@ -95,6 +108,191 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'do-execute' });
   }
 
+  /**
+   * Open the model dropdown for one role: fetch the catalog, show a QuickPick,
+   * and persist the choice into `masterx.masterModel` / `masterx.workerModel`.
+   */
+  async pickModel(role: ModelRole): Promise<void> {
+    const { config, warnings } = loadConfig();
+    for (const warning of warnings) {
+      this.log(warning, 'warn');
+    }
+
+    const title = role === 'master' ? 'Select Master model' : 'Select Worker model';
+    const current = role === 'master' ? config.master.model : config.worker.model;
+    const settingKey = role === 'master' ? 'masterModel' : 'workerModel';
+
+    let items: vscode.QuickPickItem[] = [];
+    let catalogNote = '';
+
+    if (!config.openAiApiKey) {
+      catalogNote =
+        'No OpenAI API key configured (set `masterx.openAiApiKey`). You can still type a model id below.';
+    } else {
+      try {
+        this.log(`Fetching model list from ${config.modelListUrl}…`, 'debug');
+        const catalog = await fetchModelList({
+          url: config.modelListUrl,
+          apiKey: config.openAiApiKey,
+        });
+        const models = preferChatModels(catalog);
+        items = models.map((m) => this.toQuickPickItem(m, current));
+        this.log(`Model catalog: ${models.length} model(s) available.`, 'debug');
+      } catch (error) {
+        const message =
+          error instanceof ModelCatalogError
+            ? error.message
+            : error instanceof Error
+              ? error.message
+              : String(error);
+        catalogNote = `Could not load the model list: ${message} You can still type a model id below.`;
+        this.log(catalogNote, 'warn');
+      }
+    }
+
+    // Always offer manual entry, and surface the currently selected id first.
+    const manualItem: vscode.QuickPickItem = {
+      label: '$(edit) Enter a model id…',
+      description: 'type it by hand',
+      detail: catalogNote || 'Use this when the model is not in the list.',
+      alwaysShow: true,
+    };
+
+    const currentItems: vscode.QuickPickItem[] =
+      current && !items.some((i) => i.label === current)
+        ? [
+            {
+              label: current,
+              description: '(currently selected)',
+              detail: 'Not present in the catalog — keep using it as-is.',
+              alwaysShow: true,
+            },
+          ]
+        : [];
+
+    const quickPick = vscode.window.createQuickPick();
+    quickPick.title = title;
+    quickPick.placeholder =
+      items.length > 0
+        ? 'Search models — press Enter to choose, or pick “Enter a model id…”'
+        : catalogNote || 'Type a model id';
+    quickPick.items = [...currentItems, ...items, manualItem];
+    quickPick.matchOnDescription = true;
+    quickPick.matchOnDetail = true;
+
+    const picked = await new Promise<vscode.QuickPickItem | undefined>((resolve) => {
+      quickPick.onDidAccept(() => {
+        resolve(quickPick.selectedItems[0]);
+        quickPick.hide();
+      });
+      quickPick.onDidHide(() => {
+        resolve(undefined);
+        quickPick.dispose();
+      });
+      quickPick.show();
+    });
+
+    if (!picked) {
+      this.log(`No ${role} model selected — keeping "${current}".`, 'info');
+      return;
+    }
+
+    if (picked === manualItem) {
+      await this.promptCustomModel(role);
+      return;
+    }
+
+    const chosen = picked.label;
+    await this.saveModelSetting(settingKey, chosen);
+    this.log(`${role === 'master' ? 'Master' : 'Worker'} model set to "${chosen}".`, 'success');
+    this.postInit();
+  }
+
+  /** Ask for a free-form model id and persist it. */
+  private async promptCustomModel(role: ModelRole): Promise<void> {
+    const { config } = loadConfig();
+    const current = role === 'master' ? config.master.model : config.worker.model;
+    const title = role === 'master' ? 'Select Master model' : 'Select Worker model';
+
+    const chosen = await vscode.window.showInputBox({
+      title,
+      prompt: 'Model id or alias (e.g. `opus`, `sonnet`, `z-ai/glm-5.3-flash`)',
+      value: current,
+      ignoreFocusOut: true,
+      validateInput: (value) =>
+        value.trim().length === 0 ? 'Enter a model id' : undefined,
+    });
+
+    if (!chosen) {
+      this.log(`No ${role} model selected — keeping "${current}".`, 'info');
+      this.postInit();
+      return;
+    }
+
+    const model = chosen.trim();
+    await this.saveModelSetting(role === 'master' ? 'masterModel' : 'workerModel', model);
+    this.log(`${role === 'master' ? 'Master' : 'Worker'} model set to "${model}".`, 'success');
+    this.postInit();
+  }
+
+  /** Fetch (once) and post the model catalog for the in-panel dropdowns. */
+  private async refreshModels(): Promise<void> {
+    const { config } = loadConfig();
+    if (!config.openAiApiKey) {
+      this.log('Model catalog unavailable: no OpenAI API key configured.', 'debug');
+      this.post({ type: 'models', models: [] });
+      return;
+    }
+    try {
+      if (!this.catalog) {
+        this.log(`Fetching model list from ${config.modelListUrl}…`, 'debug');
+        const catalog = await fetchModelList({
+          url: config.modelListUrl,
+          apiKey: config.openAiApiKey,
+        });
+        this.catalog = preferChatModels(catalog).map((m) => m.id);
+        this.log(`Model catalog: ${this.catalog.length} model(s) available.`, 'debug');
+      }
+      this.post({ type: 'models', models: this.catalog });
+    } catch (error) {
+      const message =
+        error instanceof ModelCatalogError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      this.log(`Could not load the model list: ${message}`, 'warn');
+      this.post({ type: 'models', models: [] });
+    }
+  }
+
+  /** Persist a model choice into VS Code user settings. */
+  private async saveModelSetting(key: 'masterModel' | 'workerModel', value: string): Promise<void> {
+    const cfg = vscode.workspace.getConfiguration('masterx');
+    // Workspace wins when a folder is open so a project can pin its own pair;
+    // otherwise fall back to user settings.
+    const target = vscode.workspace.workspaceFolders?.length
+      ? vscode.ConfigurationTarget.Workspace
+      : vscode.ConfigurationTarget.Global;
+    try {
+      await cfg.update(key, value, target);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.log(`Could not save masterx.${key}: ${detail}`, 'error');
+    }
+  }
+
+  /** Map a catalog entry onto a QuickPick row. */
+  private toQuickPickItem(model: ModelInfo, current: string): vscode.QuickPickItem {
+    const isCurrent = model.id === current;
+    return {
+      label: model.id,
+      description: model.ownedBy ? model.ownedBy : undefined,
+      detail: isCurrent ? '(currently selected)' : undefined,
+      alwaysShow: isCurrent,
+    };
+  }
+
   /** Show the resolved configuration in a readable quick-pick. */
   async showConfig(): Promise<void> {
     const { config, warnings } = loadConfig();
@@ -111,6 +309,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       '',
       `Worker model:        ${config.worker.model}`,
       `Worker source:       ${config.worker.modelSource}`,
+      '',
+      `Model catalog URL:   ${config.modelListUrl}`,
+      `OpenAI API key:      ${config.openAiApiKey ? `${config.openAiApiKey.slice(0, 4)}…${config.openAiApiKey.slice(-4)} (${config.openAiApiKey.length} chars)` : '(not set)'}`,
+      '',
+      'Run-scoped settings.json written for each task run:',
+      ...describeRunSettings({
+        masterModel: resolveModelId('master', config.master.model),
+        workerModel: resolveModelId('worker', config.worker.model),
+        openAiApiKey: config.openAiApiKey,
+      }).map((line) => `  ${line}`),
       '',
       `Workspace folder:    ${this.workspaceFolderLabel()}`,
       '',
@@ -142,11 +350,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     switch (message?.type) {
       case 'ready':
         this.postInit();
+        void this.refreshModels();
         return;
 
       case 'reset':
         this.post({ type: 'reset' });
         this.postInit();
+        return;
+
+      case 'stop':
+        if (!this.abortController) {
+          this.log('No run in progress.', 'warn');
+          return;
+        }
+        this.abortController.abort();
+        this.log('Stop requested — halting the current run…', 'warn');
         return;
 
       case 'execute': {
@@ -160,6 +378,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           return;
         }
         await this.runGoal(goal);
+        return;
+      }
+
+      case 'set-model': {
+        const role: ModelRole = message.role === 'worker' ? 'worker' : 'master';
+        const model = (message.model ?? '').trim();
+        if (!model) {
+          this.log('Model id cannot be empty.', 'warn');
+          return;
+        }
+        await this.saveModelSetting(role === 'master' ? 'masterModel' : 'workerModel', model);
+        this.log(`${role === 'master' ? 'Master' : 'Worker'} model set to "${model}".`, 'success');
+        this.postInit();
+        return;
+      }
+
+      case 'custom-model': {
+        const role: ModelRole = message.role === 'worker' ? 'worker' : 'master';
+        await this.promptCustomModel(role);
         return;
       }
 
@@ -185,7 +422,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       type: 'init',
       masterModel: config.master.model,
       workerModel: config.worker.model,
-      workspaceFolder: this.workspaceFolderLabel(),
     });
 
     for (const warning of warnings) {
@@ -218,12 +454,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // ------------------------------------------------------------------- runner
 
   private async runGoal(goal: string): Promise<void> {
+    const abort = new AbortController();
+    this.abortController = abort;
     this.running = true;
     this.post({ type: 'busy', value: true });
-    this.post({ type: 'reset' });
+    this.post({ type: 'user-input', text: goal });
     this.postInit();
-    this.log(`Goal: ${goal}`, 'info');
 
+    let runSettingsPath: string | undefined;
     try {
       const { config, warnings } = loadConfig();
       for (const warning of warnings) {
@@ -241,19 +479,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       const cwd = this.requireWorkspaceRootPath();
 
+      // Run-scoped settings.json: carries the model ids chosen in the dropdowns
+      // and the OpenAI API key, merged over ~/.claude/settings.json by the CLI.
+      // The global file is never modified; this one is deleted after the run.
+      const runSettings = writeRunSettings({
+        masterModel: resolveModelId('master', config.master.model),
+        workerModel: resolveModelId('worker', config.worker.model),
+        openAiApiKey: config.openAiApiKey,
+      });
+      runSettingsPath = runSettings.path;
+      this.log(
+        `Run settings: ${path.basename(runSettings.path)} → ${runSettings.keys.join(', ') || '(no overrides)'}`,
+        'debug'
+      );
+
       // Two independent `claude` CLI instances with different models: a cheap
       // Worker that indexes and drafts, a deep-thinking Master that plans and
-      // reviews. The CLI owns authentication via ~/.claude/settings.json.
+      // reviews.
       const worker = new Worker({
         cliPath: config.claudeCliPath,
         cwd,
-        model: config.worker.model,
+        model: resolveModelId('worker', config.worker.model),
+        settingsPath: runSettings.path,
+        signal: abort.signal,
         log: (message, level) => this.log(message, level),
       });
       const master = new Master({
         cliPath: config.claudeCliPath,
         cwd,
-        model: config.master.model,
+        model: resolveModelId('master', config.master.model),
+        settingsPath: runSettings.path,
+        signal: abort.signal,
         log: (message, level) => this.log(message, level),
       });
 
@@ -261,22 +517,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         onLog: (message, level) => this.log(message, level),
         onStage: (stage: StageId, detail: string) =>
           this.post({ type: 'stage', stage, detail }),
-        onSubtasks: (tasks: SubTask[]) =>
-          this.post({
-            type: 'subtasks',
-            tasks: tasks.map((t) => ({ id: t.id, action: t.action, targetPath: t.targetPath })),
-          }),
-        onTask: (id: string, status: TaskStatus, detail: string) =>
-          this.post({ type: 'task', id, status, detail }),
         onSummary: (text: string) => this.post({ type: 'summary', text }),
       });
 
-      await orchestrator.run(goal);
+      await orchestrator.run(goal, abort.signal);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.log(message, 'error');
       this.post({ type: 'stage', stage: 'error', detail: message });
     } finally {
+      disposeRunSettings(runSettingsPath);
+      this.abortController = undefined;
       this.running = false;
       this.post({ type: 'busy', value: false });
     }
@@ -309,9 +560,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       margin: 0;
       padding: 10px;
       font-family: var(--mx-font);
-      font-size: var(--vscode-font-size);
+      font-size: calc(var(--vscode-font-size) + 5px);
       color: var(--vscode-foreground);
-      background: var(--vscode-sideBar-background);
+      background: var(--vscode-panel-background, var(--vscode-sideBar-background));
       display: flex;
       flex-direction: column;
       gap: var(--mx-gap);
@@ -319,57 +570,220 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       overflow: hidden;
     }
 
-    /* ---------- status bar ---------- */
-    .status {
+    /* ---------- console ---------- */
+    .console-wrap {
       display: flex;
       flex-direction: column;
       gap: 4px;
-      padding: 8px;
+      flex: 1;
+      min-height: 0;
+    }
+    .console-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 15px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--vscode-descriptionForeground);
+    }
+    .console {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 6px;
       border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
       border-radius: var(--mx-radius);
       background: var(--vscode-editor-background);
+      font-family: var(--mx-mono);
+      font-size: 15px;
+      line-height: 1.55;
     }
-    .status-row {
+    .log-line { white-space: pre-wrap; word-break: break-word; }
+    .log-line.info    { color: var(--vscode-foreground); }
+    .log-line.debug   { color: var(--vscode-descriptionForeground); }
+    .log-line.warn    { color: var(--vscode-charts-yellow); }
+    .log-line.error   { color: var(--vscode-charts-red); }
+    .log-line.success { color: var(--vscode-charts-green); }
+    .log-line.user {
+      margin: 12px 0 2px;
+      padding: 6px 8px;
+      font-size: 18px;
+      font-weight: 600;
+      text-align: right;
+      border-right: 3px solid var(--vscode-progressBar-background);
+      background: var(--vscode-textBlockQuote-background, rgba(127, 127, 127, 0.08));
+      border-radius: 3px;
+    }
+    .log-line.separator {
+      margin: 2px 0 8px;
+      color: var(--vscode-descriptionForeground);
+      opacity: 0.55;
+      white-space: pre;
+      overflow: hidden;
+    }
+    .log-line.stage-banner {
+      margin: 14px 0 4px;
+      padding-top: 6px;
+      border-top: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+      font-family: var(--mx-font);
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--vscode-descriptionForeground);
+    }
+    .log-line.master {
+      margin: 12px 0 2px;
+    }
+    .log-line.master .entry-label {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--vscode-charts-green);
+    }
+
+    /* ---------- progress tracker (stage stack) ---------- */
+    .tracker {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      flex-shrink: 0;
+      min-height: 0;
+      max-height: 30vh;
+      overflow-y: auto;
+    }
+    .stage-empty {
+      padding: 4px 6px;
+      font-size: 15px;
+      color: var(--vscode-descriptionForeground);
+    }
+    .stage-row {
+      border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+      border-radius: var(--mx-radius);
+      background: var(--vscode-editor-background);
+      flex-shrink: 0;
+    }
+    .stage-head {
       display: flex;
       align-items: center;
       gap: 6px;
-      font-size: 11px;
-      line-height: 1.4;
+      padding: 3px 6px;
+      font-size: 16px;
+      cursor: pointer;
     }
-    .status-label {
-      color: var(--vscode-descriptionForeground);
-      min-width: 52px;
+    .stage-head:hover {
+      color: var(--vscode-textLink-foreground);
     }
-    .status-value {
-      color: var(--vscode-foreground);
-      font-family: var(--mx-mono);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .status-dot {
-      width: 7px;
-      height: 7px;
+    .stage-head .dot {
+      width: 10px;
+      height: 10px;
       border-radius: 50%;
+      border: 1.5px solid var(--vscode-descriptionForeground);
       flex-shrink: 0;
+    }
+    .stage-row.status-running {
+      background: var(--vscode-list-activeSelectionBackground);
+      color: var(--vscode-list-activeSelectionForeground);
+    }
+    .stage-row.status-running .dot {
+      border-color: var(--vscode-progressBar-background);
+      background: var(--vscode-progressBar-background);
+      animation: mx-pulse 1.2s ease-in-out infinite;
+    }
+    .stage-row.status-done .dot {
+      border-color: var(--vscode-charts-green);
       background: var(--vscode-charts-green);
     }
-    .status-dot.warn { background: var(--vscode-charts-yellow); }
-    .status-dot.error { background: var(--vscode-charts-red); }
+    .stage-row.status-failed .dot {
+      border-color: var(--vscode-charts-red);
+      background: var(--vscode-charts-red);
+    }
+    .stage-row.status-stopped .dot {
+      border-color: var(--vscode-descriptionForeground);
+      background: var(--vscode-descriptionForeground);
+      opacity: 0.6;
+    }
+    .stage-title {
+      font-weight: 600;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .chevron {
+      margin-left: auto;
+      flex-shrink: 0;
+      font-size: 12px;
+      opacity: 0.7;
+      transform: rotate(-90deg);
+      transition: transform 0.15s ease;
+    }
+    .stage-row.expanded .chevron {
+      transform: rotate(0deg);
+    }
+    .stage-detail {
+      display: none;
+      padding: 2px 8px 5px 22px;
+      font-size: 15px;
+      color: var(--vscode-descriptionForeground);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .stage-row.expanded .stage-detail {
+      display: block;
+    }
+    @keyframes mx-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.45; }
+    }
 
-    /* ---------- input area ---------- */
+    /* ---------- model selection row ---------- */
+    .model-row {
+      display: flex;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+    .model-cell {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: 1;
+      min-width: 0;
+    }
+    .model-label {
+      font-size: 15px;
+      color: var(--vscode-descriptionForeground);
+      flex-shrink: 0;
+    }
+    .model-select {
+      flex: 1;
+      min-width: 0;
+      padding: 3px 6px;
+      font-family: var(--mx-mono);
+      font-size: calc(var(--vscode-font-size) + 5px);
+      color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
+      background: var(--vscode-dropdown-background, var(--vscode-input-background));
+      border: 1px solid var(--vscode-dropdown-border, var(--vscode-widget-border, var(--vscode-panel-border)));
+      border-radius: var(--mx-radius);
+      outline: none;
+    }
+    .model-select:focus {
+      border-color: var(--vscode-focusBorder);
+    }
+
+    /* ---------- chatbox ---------- */
     .input-area {
       display: flex;
       flex-direction: column;
       gap: 6px;
+      flex-shrink: 0;
     }
     textarea#goal {
       width: 100%;
-      min-height: 64px;
+      min-height: 48px;
       resize: vertical;
       padding: 6px 8px;
       font-family: var(--mx-font);
-      font-size: var(--vscode-font-size);
+      font-size: calc(var(--vscode-font-size) + 5px);
       color: var(--vscode-input-foreground);
       background: var(--vscode-input-background);
       border: 1px solid var(--vscode-input-border, transparent);
@@ -387,7 +801,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       flex: 1;
       padding: 5px 10px;
       font-family: var(--mx-font);
-      font-size: var(--vscode-font-size);
+      font-size: calc(var(--vscode-font-size) + 5px);
       border: none;
       border-radius: var(--mx-radius);
       cursor: pointer;
@@ -413,215 +827,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     button.secondary:hover:not(:disabled) {
       background: var(--vscode-button-secondaryHoverBackground);
     }
-
-    /* ---------- progress tracker ---------- */
-    .tracker {
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-    }
-    .stage {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 3px 4px;
-      font-size: 11px;
-      border-radius: var(--mx-radius);
-    }
-    .stage .marker {
-      width: 12px;
-      height: 12px;
-      border-radius: 50%;
-      border: 1.5px solid var(--vscode-descriptionForeground);
-      flex-shrink: 0;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .stage.active {
-      background: var(--vscode-list-activeSelectionBackground);
-      color: var(--vscode-list-activeSelectionForeground);
-    }
-    .stage.active .marker {
-      border-color: var(--vscode-progressBar-background);
-      background: var(--vscode-progressBar-background);
-    }
-    .stage.done .marker {
-      border-color: var(--vscode-charts-green);
-      background: var(--vscode-charts-green);
-    }
-    .stage.error .marker {
-      border-color: var(--vscode-charts-red);
-      background: var(--vscode-charts-red);
-    }
-    .stage-title { font-weight: 600; }
-    .stage-detail {
-      margin-left: auto;
-      color: var(--vscode-descriptionForeground);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      max-width: 55%;
-    }
-
-    /* ---------- task list ---------- */
-    .task-list {
-      margin: 4px 0 0 18px;
-      padding: 0;
-      list-style: none;
-      display: none;
-      flex-direction: column;
-      gap: 2px;
-    }
-    .task-list.visible { display: flex; }
-    .task-item {
-      display: flex;
-      align-items: baseline;
-      gap: 5px;
-      font-family: var(--mx-mono);
-      font-size: 10px;
-      color: var(--vscode-descriptionForeground);
-    }
-    .task-item .badge {
-      font-family: var(--mx-font);
-      padding: 0 4px;
-      border-radius: 2px;
-      background: var(--vscode-badge-background);
-      color: var(--vscode-badge-foreground);
-      flex-shrink: 0;
-    }
-    .task-item.status-running { color: var(--vscode-foreground); }
-    .task-item.status-done .badge {
-      background: var(--vscode-charts-green);
-      color: var(--vscode-editor-background);
-    }
-    .task-item.status-failed .badge {
-      background: var(--vscode-charts-red);
-      color: var(--vscode-editor-background);
-    }
-    .task-item .path {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    /* ---------- summary ---------- */
-    .summary {
-      display: none;
-      white-space: pre-wrap;
-      word-break: break-word;
-      padding: 8px;
-      border-radius: var(--mx-radius);
-      border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
-      background: var(--vscode-editor-background);
-      max-height: 30vh;
-      overflow-y: auto;
-      font-size: 11px;
-      line-height: 1.5;
-    }
-    .summary.visible { display: block; }
-
-    /* ---------- console ---------- */
-    .console-wrap {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-      flex: 1;
-      min-height: 90px;
-    }
-    .console-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--vscode-descriptionForeground);
-    }
-    .console {
-      flex: 1;
-      min-height: 90px;
-      overflow-y: auto;
-      padding: 6px;
-      border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
-      border-radius: var(--mx-radius);
-      background: var(--vscode-editor-background);
-      font-family: var(--mx-mono);
-      font-size: 10px;
-      line-height: 1.55;
-    }
-    .log-line { white-space: pre-wrap; word-break: break-word; }
-    .log-line.info    { color: var(--vscode-foreground); }
-    .log-line.debug   { color: var(--vscode-descriptionForeground); }
-    .log-line.warn    { color: var(--vscode-charts-yellow); }
-    .log-line.error   { color: var(--vscode-charts-red); }
-    .log-line.success { color: var(--vscode-charts-green); }
-
-    /* ---------- misc ---------- */
-    .footer {
-      font-size: 10px;
-      color: var(--vscode-descriptionForeground);
-      text-align: center;
+    button.secondary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
     }
     .hint {
-      font-size: 10px;
+      font-size: 15px;
       color: var(--vscode-descriptionForeground);
+    }
+
+    /* ---------- footer ---------- */
+    .footer {
+      padding-top: 4px;
+      flex-shrink: 0;
+      font-size: 15px;
+      color: var(--vscode-descriptionForeground);
+      text-align: center;
     }
   </style>
 </head>
 <body>
-  <div class="status" aria-label="Model status">
-    <div class="status-row">
-      <span class="status-dot" id="masterDot"></span>
-      <span class="status-label">Master</span>
-      <span class="status-value" id="masterModel" title="">loading…</span>
-    </div>
-    <div class="status-row">
-      <span class="status-dot" id="workerDot"></span>
-      <span class="status-label">Worker</span>
-      <span class="status-value" id="workerModel" title="">loading…</span>
-    </div>
-    <div class="status-row">
-      <span class="status-label">Folder</span>
-      <span class="status-value" id="workspaceFolder" title="">—</span>
-    </div>
-  </div>
-
-  <div class="input-area">
-    <textarea id="goal" placeholder="Describe the goal, e.g. 'Add a REST endpoint that lists all TODO items'" spellcheck="false"></textarea>
-    <div class="button-row">
-      <button class="primary" id="executeBtn" type="button">▶ Execute</button>
-      <button class="secondary" id="resetBtn" type="button">↺ Reset</button>
-    </div>
-    <div class="hint">Worker indexes & drafts · Master plans & reviews · keys never leave your machine</div>
-  </div>
-
-  <div class="tracker" id="tracker">
-    <div class="stage" data-stage="indexing">
-      <span class="marker"></span>
-      <span class="stage-title">1 · Worker Indexing</span>
-      <span class="stage-detail"></span>
-    </div>
-    <div class="stage" data-stage="planning">
-      <span class="marker"></span>
-      <span class="stage-title">2 · Master Planning</span>
-      <span class="stage-detail"></span>
-    </div>
-    <div class="stage" data-stage="executing">
-      <span class="marker"></span>
-      <span class="stage-title">3 · Worker Executing</span>
-      <span class="stage-detail"></span>
-    </div>
-    <div class="stage" data-stage="completed">
-      <span class="marker"></span>
-      <span class="stage-title">4 · Completed</span>
-      <span class="stage-detail"></span>
-    </div>
-    <ul class="task-list" id="taskList"></ul>
-  </div>
-
-  <div class="summary" id="summary"></div>
-
   <div class="console-wrap">
     <div class="console-head">
       <span>Console</span>
@@ -630,30 +855,60 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div class="console" id="console"></div>
   </div>
 
+  <div class="tracker" id="tracker">
+    <div class="stage-empty" id="stageEmpty">Idle — enter a goal and press Execute</div>
+  </div>
+
+  <div class="model-row">
+    <div class="model-cell">
+      <label class="model-label" for="masterModel">Master</label>
+      <select class="model-select" id="masterModel" aria-label="Select Master model"></select>
+    </div>
+    <div class="model-cell">
+      <label class="model-label" for="workerModel">Worker</label>
+      <select class="model-select" id="workerModel" aria-label="Select Worker model"></select>
+    </div>
+  </div>
+
+  <div class="input-area">
+    <textarea id="goal" placeholder="Describe the goal, e.g. 'Add a REST endpoint that lists all TODO items'" spellcheck="false"></textarea>
+    <div class="button-row">
+      <button class="primary" id="executeBtn" type="button">▶ Execute</button>
+      <button class="secondary" id="stopBtn" type="button" disabled>■ Stop</button>
+      <button class="secondary" id="resetBtn" type="button">↺ Reset</button>
+    </div>
+    <div class="hint">Worker indexes & drafts · Master plans & reviews · keys never leave your machine</div>
+  </div>
+
   <div class="footer">MasterX · asymmetric Master-Worker orchestration</div>
 
   <script nonce="${nonce}">
     (function () {
       var vscode = acquireVsCodeApi();
       var busy = false;
+      var stopRequested = false;
 
       var els = {
         masterModel: document.getElementById('masterModel'),
         workerModel: document.getElementById('workerModel'),
-        workspaceFolder: document.getElementById('workspaceFolder'),
-        masterDot: document.getElementById('masterDot'),
-        workerDot: document.getElementById('workerDot'),
         goal: document.getElementById('goal'),
         executeBtn: document.getElementById('executeBtn'),
+        stopBtn: document.getElementById('stopBtn'),
         resetBtn: document.getElementById('resetBtn'),
         tracker: document.getElementById('tracker'),
-        taskList: document.getElementById('taskList'),
-        summary: document.getElementById('summary'),
+        stageEmpty: document.getElementById('stageEmpty'),
         console: document.getElementById('console'),
         logCount: document.getElementById('logCount')
       };
 
-      var STAGES = ['indexing', 'planning', 'executing', 'completed'];
+      var STAGE_TITLES = {
+        indexing: 'Scout (worker)',
+        planning: 'Plan (master)',
+        executing: 'Execute (worker)',
+        completed: 'Verify (master)'
+      };
+      var CUSTOM = '__custom__';
+      var state = { masterModel: '', workerModel: '', models: [] };
       var logTotal = 0;
 
       function post(msg) {
@@ -663,13 +918,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       function setBusy(value) {
         busy = value;
         els.executeBtn.disabled = value;
+        els.stopBtn.disabled = !value;
         els.executeBtn.textContent = value ? '⏳ Running…' : '▶ Execute';
       }
 
-      function appendLog(message, level) {
+      function dashRule() {
+        var count = Math.max(24, Math.floor((els.console.clientWidth - 12) / 9));
+        var rule = '';
+        while (rule.length < count) { rule += '-'; }
+        return rule;
+      }
+
+      function pushLine(cls, text) {
         var line = document.createElement('div');
-        line.className = 'log-line ' + (level || 'info');
-        line.textContent = message;
+        line.className = 'log-line ' + cls;
+        line.textContent = text;
         els.console.appendChild(line);
         logTotal += 1;
         els.logCount.textContent = String(logTotal);
@@ -677,70 +940,161 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         while (els.console.childElementCount > 800) {
           els.console.removeChild(els.console.firstChild);
         }
+        return line;
       }
 
-      function resetStages() {
-        var nodes = els.tracker.querySelectorAll('.stage');
-        for (var i = 0; i < nodes.length; i++) {
-          nodes[i].className = 'stage';
-          var detail = nodes[i].querySelector('.stage-detail');
-          if (detail) { detail.textContent = ''; }
+      function appendLog(message, level) {
+        pushLine(level || 'info', message);
+      }
+
+      function appendUserEntry(text) {
+        pushLine('user', text);
+        pushLine('separator', dashRule());
+      }
+
+      function appendMasterReport(text) {
+        var line = pushLine('master', '');
+        var label = document.createElement('span');
+        label.className = 'entry-label';
+        label.textContent = 'Master: ';
+        line.appendChild(label);
+        line.appendChild(document.createTextNode(text));
+      }
+
+      function clearStages() {
+        var rows = els.tracker.querySelectorAll('.stage-row');
+        for (var i = 0; i < rows.length; i++) {
+          els.tracker.removeChild(rows[i]);
         }
-        els.taskList.innerHTML = '';
-        els.taskList.className = 'task-list';
-        els.summary.textContent = '';
-        els.summary.className = 'summary';
+        els.stageEmpty.style.display = 'block';
+      }
+
+      function stageRow(stage) {
+        var row = els.tracker.querySelector('.stage-row[data-stage="' + stage + '"]');
+        if (row) { return row; }
+        row = document.createElement('div');
+        row.className = 'stage-row status-running';
+        row.setAttribute('data-stage', stage);
+        var head = document.createElement('div');
+        head.className = 'stage-head';
+        var dot = document.createElement('span');
+        dot.className = 'dot';
+        var title = document.createElement('span');
+        title.className = 'stage-title';
+        title.textContent = STAGE_TITLES[stage] || stage;
+        var chevron = document.createElement('span');
+        chevron.className = 'chevron';
+        chevron.textContent = '▾';
+        head.appendChild(dot);
+        head.appendChild(title);
+        head.appendChild(chevron);
+        var detail = document.createElement('div');
+        detail.className = 'stage-detail';
+        row.appendChild(head);
+        row.appendChild(detail);
+        row.addEventListener('click', function () {
+          row.classList.toggle('expanded');
+        });
+        els.tracker.appendChild(row);
+        els.stageEmpty.style.display = 'none';
+        return row;
+      }
+
+      function markRunningDone() {
+        var running = els.tracker.querySelectorAll('.stage-row.status-running');
+        for (var i = 0; i < running.length; i++) {
+          running[i].classList.remove('status-running');
+          running[i].classList.add('status-done');
+        }
       }
 
       function setStage(stage, detail) {
-        var order = STAGES.indexOf(stage);
         if (stage === 'error') {
-          var active = els.tracker.querySelector('.stage.active');
-          if (active) { active.className = 'stage error'; }
-          if (detail) { appendLog('FAILED: ' + detail, 'error'); }
+          var stopped = stopRequested;
+          var row = els.tracker.querySelector('.stage-row.status-running');
+          if (row) {
+            row.classList.remove('status-running');
+            row.classList.add(stopped ? 'status-stopped' : 'status-failed');
+            row.querySelector('.stage-detail').textContent = detail || '';
+          }
+          if (detail) {
+            appendLog(stopped ? 'Stopped: ' + detail : 'FAILED: ' + detail, stopped ? 'warn' : 'error');
+          }
           return;
         }
-        for (var i = 0; i < STAGES.length; i++) {
-          var node = els.tracker.querySelector('.stage[data-stage="' + STAGES[i] + '"]');
-          if (!node) { continue; }
-          if (i < order) { node.className = 'stage done'; }
-          else if (i === order) { node.className = 'stage active'; }
-          else { node.className = 'stage'; }
+        var active = stageRow(stage);
+        var running = els.tracker.querySelectorAll('.stage-row.status-running');
+        for (var i = 0; i < running.length; i++) {
+          if (running[i] !== active) {
+            running[i].classList.remove('status-running');
+            running[i].classList.add('status-done');
+          }
         }
-        if (order >= 0) {
-          var current = els.tracker.querySelector('.stage[data-stage="' + stage + '"] .stage-detail');
-          if (current) { current.textContent = detail || ''; }
-        }
+        active.classList.remove('status-done');
+        active.classList.remove('status-failed');
+        active.classList.add('status-running');
+        active.querySelector('.stage-detail').textContent = detail || '';
+        pushLine('stage-banner', STAGE_TITLES[stage] || stage);
       }
 
-      function addSubtasks(tasks) {
-        els.taskList.innerHTML = '';
-        for (var i = 0; i < tasks.length; i++) {
-          var li = document.createElement('li');
-          li.className = 'task-item status-pending';
-          li.id = 'task-' + tasks[i].id;
-          li.innerHTML = '<span class="badge">' + tasks[i].id + '</span>' +
-            '<span class="path">' + tasks[i].action + ' · ' + tasks[i].targetPath + '</span>';
-          els.taskList.appendChild(li);
-        }
-        els.taskList.className = 'task-list visible';
+      function setDone() {
+        markRunningDone();
       }
 
-      function setTask(id, status, detail) {
-        var li = document.getElementById('task-' + id);
-        if (!li) { return; }
-        li.className = 'task-item status-' + status;
-        var badge = li.querySelector('.badge');
-        if (badge) {
-          badge.textContent = status === 'done' ? '✓' : status === 'failed' ? '✕' : id;
+      function fillSelect(select, current) {
+        select.innerHTML = '';
+        var auto = document.createElement('option');
+        auto.value = 'Auto';
+        auto.textContent = 'Auto';
+        select.appendChild(auto);
+        if (!current) {
+          var unset = document.createElement('option');
+          unset.value = '';
+          unset.textContent = '(unset)';
+          select.appendChild(unset);
         }
-        li.title = detail || '';
+        var inCatalog = false;
+        for (var i = 0; i < state.models.length; i++) {
+          if (state.models[i] === current) { inCatalog = true; }
+          var opt = document.createElement('option');
+          opt.value = state.models[i];
+          opt.textContent = state.models[i];
+          select.appendChild(opt);
+        }
+        if (current && current !== 'Auto' && !inCatalog) {
+          var custom = document.createElement('option');
+          custom.value = current;
+          custom.textContent = current + ' (custom)';
+          select.appendChild(custom);
+        }
+        var entry = document.createElement('option');
+        entry.value = CUSTOM;
+        entry.textContent = 'Enter a model id…';
+        select.appendChild(entry);
+        select.value = current;
       }
 
-      function setSummary(text) {
-        els.summary.textContent = text;
-        els.summary.className = 'summary visible';
+      function renderModels() {
+        fillSelect(els.masterModel, state.masterModel);
+        fillSelect(els.workerModel, state.workerModel);
       }
+
+      function wireSelect(select, role) {
+        select.addEventListener('change', function () {
+          var value = select.value;
+          if (value === CUSTOM) {
+            select.value = role === 'master' ? state.masterModel : state.workerModel;
+            post({ type: 'custom-model', role: role });
+            return;
+          }
+          var current = role === 'master' ? state.masterModel : state.workerModel;
+          if (value !== current) {
+            post({ type: 'set-model', role: role, model: value });
+          }
+        });
+      }
+      wireSelect(els.masterModel, 'master');
+      wireSelect(els.workerModel, 'worker');
 
       els.executeBtn.addEventListener('click', function () {
         if (busy) { return; }
@@ -750,6 +1104,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           return;
         }
         post({ type: 'execute', goal: goal });
+      });
+
+      els.stopBtn.addEventListener('click', function () {
+        if (!busy) { return; }
+        stopRequested = true;
+        els.stopBtn.disabled = true;
+        var row = els.tracker.querySelector('.stage-row.status-running');
+        if (row) {
+          row.querySelector('.stage-detail').textContent = 'Stopping…';
+        }
+        post({ type: 'stop' });
       });
 
       els.resetBtn.addEventListener('click', function () {
@@ -773,38 +1138,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         switch (msg.type) {
           case 'init':
-            els.masterModel.textContent = msg.masterModel || '(unset)';
-            els.masterModel.title = msg.masterModel || '';
-            els.workerModel.textContent = msg.workerModel || '(unset)';
-            els.workerModel.title = msg.workerModel || '';
-            els.workspaceFolder.textContent = msg.workspaceFolder || '—';
-            els.masterDot.className = 'status-dot';
-            els.workerDot.className = 'status-dot';
-            if (!msg.masterModel) { els.masterDot.className = 'status-dot error'; }
-            if (!msg.workerModel) { els.workerDot.className = 'status-dot error'; }
+            state.masterModel = msg.masterModel || '';
+            state.workerModel = msg.workerModel || '';
+            renderModels();
+            break;
+
+          case 'models':
+            state.models = msg.models || [];
+            renderModels();
             break;
 
           case 'log':
             appendLog(msg.message, msg.level);
-            if (msg.level === 'error') {
-              els.masterDot.className = 'status-dot error';
-            }
+            break;
+
+          case 'user-input':
+            stopRequested = false;
+            appendUserEntry(msg.text || '');
+            clearStages();
+            stageRow('indexing').querySelector('.stage-detail').textContent = 'Starting…';
             break;
 
           case 'stage':
             setStage(msg.stage, msg.detail);
             break;
 
-          case 'subtasks':
-            addSubtasks(msg.tasks || []);
-            break;
-
-          case 'task':
-            setTask(msg.id, msg.status, msg.detail);
-            break;
-
           case 'summary':
-            setSummary(msg.text);
+            appendMasterReport(msg.text || '');
+            setDone();
             break;
 
           case 'busy':
@@ -812,10 +1173,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             break;
 
           case 'reset':
-            resetStages();
+            clearStages();
             logTotal = 0;
             els.logCount.textContent = '0';
             els.console.innerHTML = '';
+            stopRequested = false;
             break;
 
           case 'focus-input':

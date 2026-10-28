@@ -14,6 +14,9 @@ export const FALLBACK_MASTER_MODEL = 'claude-opus-5-5';
 /** Fallback Worker model when nothing is configured. */
 export const FALLBACK_WORKER_MODEL = 'claude-haiku-5-5';
 
+/** Default endpoint that lists the selectable models (OpenAI-compatible). */
+export const DEFAULT_MODEL_LIST_URL = 'https://creditclaim.reskilll.com/llm/v1/models';
+
 /** Minimal shape of ~/.claude/settings.json that MasterX understands. */
 interface ClaudeCliSettings {
   model?: string;
@@ -83,7 +86,7 @@ function looksLikeAlias(value: string): boolean {
  * `fable`) the way the Claude CLI does: check `ANTHROPIC_DEFAULT_<ALIAS>_MODEL`
  * first, then `ANTHROPIC_MODEL`, then fall back to the known concrete id.
  *
- * Aliases are expanded so the sidebar status bar shows a real model id; the
+ * Aliases are expanded so the panel status bar shows a real model id; the
  * alias itself is also accepted by `claude --model`.
  */
 function resolveAlias(value: string, cliEnv: Record<string, string | undefined>): string {
@@ -176,6 +179,40 @@ export function loadConfig(): ConfigLoadResult {
   }
 
   const cliEnv = cli?.settings.env ?? {};
+  const cliPathLabel = cli ? cli.path : claudeSettingsPath();
+
+  // ---- OpenAI API key (model catalog + run authentication) ----------------
+  // Precedence: masterx.openAiApiKey → OPENAI_API_KEY → ANTHROPIC_AUTH_TOKEN.
+  //
+  // The last leg exists because the default catalog endpoint is the same
+  // gateway the Claude CLI talks to, so the CLI's own bearer token is normally
+  // the one that lists its models. It is only reached when no explicit key is
+  // configured, and `firstSourced` reports which one was used so nothing is
+  // picked up silently.
+  const openAiApiKey =
+    firstSourced(
+      { value: cfg.get<string>('openAiApiKey'), source: 'masterx.openAiApiKey setting' },
+      { value: process.env.OPENAI_API_KEY, source: 'OPENAI_API_KEY environment variable' },
+      {
+        value: cliEnv.ANTHROPIC_AUTH_TOKEN,
+        source: `${cliPathLabel} → env.ANTHROPIC_AUTH_TOKEN`,
+      },
+      { value: process.env.ANTHROPIC_AUTH_TOKEN, source: 'ANTHROPIC_AUTH_TOKEN environment variable' }
+    )?.value ?? '';
+
+  // ---- Model catalog endpoint --------------------------------------------
+  const modelListUrl =
+    cfg.get<string>('modelListUrl')?.trim() || DEFAULT_MODEL_LIST_URL;
+
+  // Advisory only: without the key the dropdown falls back to manual entry and
+  // the CLI run inherits credentials from ~/.claude/settings.json.
+  if (!openAiApiKey) {
+    warnings.push(
+      'No API key resolved for the model catalog — the dropdown cannot fetch the model list and ' +
+        'will ask for a model id by hand. Set `masterx.openAiApiKey`, or OPENAI_API_KEY / ' +
+        'ANTHROPIC_AUTH_TOKEN in the environment or ~/.claude/settings.json.'
+    );
+  }
 
   // ---- Claude CLI binary -------------------------------------------------
   let claudeCliPath = '';
@@ -185,8 +222,6 @@ export function loadConfig(): ConfigLoadResult {
     const detail = error instanceof Error ? error.message : String(error);
     warnings.push(detail);
   }
-
-  const cliPathLabel = cli ? cli.path : claudeSettingsPath();
 
   // ---- Master model (deep reasoning) -------------------------------------
   // Precedence: masterx.masterModel → masterx.anthropicModel (legacy alias for
@@ -246,7 +281,13 @@ export function loadConfig(): ConfigLoadResult {
   }
 
   return {
-    config: { claudeCliPath, master, worker },
+    config: {
+      claudeCliPath,
+      master,
+      worker,
+      openAiApiKey,
+      modelListUrl,
+    },
     warnings,
   };
 }

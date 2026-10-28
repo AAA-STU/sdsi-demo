@@ -8,3 +8,4 @@ tsconfig.json
 !README.md
 node_modules/@types/**
 node_modules/typescript/**
+docs/**

@@ -23,7 +23,7 @@
   "main": "./out/extension.js",
   "contributes": {
     "viewsContainers": {
-      "activitybar": [
+      "panel": [
         {
           "id": "masterx-sidebar",
           "title": "MasterX",
@@ -61,11 +61,35 @@
         "command": "masterx.showConfig",
         "title": "MasterX: Show Resolved Configuration",
         "icon": "$(settings-gear)"
+      },
+      {
+        "command": "masterx.selectMasterModel",
+        "title": "MasterX: Select Master Model",
+        "icon": "$(list-selection)",
+        "category": "MasterX"
+      },
+      {
+        "command": "masterx.selectWorkerModel",
+        "title": "MasterX: Select Worker Model",
+        "icon": "$(list-selection)",
+        "category": "MasterX"
       }
     ],
     "configuration": {
       "title": "MasterX",
       "properties": {
+        "masterx.openAiApiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "API key for the model catalog (`masterx.modelListUrl`) and the bearer token written into the run-scoped `settings.json`. Falls back to `OPENAI_API_KEY`, then `ANTHROPIC_AUTH_TOKEN` from `~/.claude/settings.json` or the environment.",
+          "scope": "window"
+        },
+        "masterx.modelListUrl": {
+          "type": "string",
+          "default": "https://creditclaim.reskilll.com/llm/v1/models",
+          "markdownDescription": "OpenAI-compatible endpoint that returns the list of selectable models (`GET`, `Authorization: Bearer <key>`). Point this at your gateway's `/v1/models` to list its models.",
+          "scope": "window"
+        },
         "masterx.claudeCliPath": {
           "type": "string",
           "default": "",
@@ -75,13 +99,13 @@
         "masterx.masterModel": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Model id or alias (`opus` / `sonnet` / `haiku` / `fable`) used by the **Master** (planning + synthesis). When empty, resolves from `~/.claude/settings.json` → `model`, then `ANTHROPIC_MODEL`.",
+          "markdownDescription": "Model id or alias for the **Master** (planning + synthesis). Choose it with **MasterX: Select Master Model** or by clicking the Master row in the panel. When empty, resolves from `~/.claude/settings.json` → `model`, then `ANTHROPIC_MODEL`.",
           "scope": "window"
         },
         "masterx.workerModel": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Model id or alias used by the **Worker** (indexing + code drafting). When empty, resolves from `CLAUDE_CODE_SUBAGENT_MODEL`, then `ANTHROPIC_DEFAULT_HAIKU_MODEL` in `~/.claude/settings.json`. Use a lighter model than the Master — that asymmetry is the point.",
+          "markdownDescription": "Model id or alias for the **Worker** (indexing + code drafting). Choose it with **MasterX: Select Worker Model** or by clicking the Worker row in the panel. When empty, resolves from `CLAUDE_CODE_SUBAGENT_MODEL`, then `ANTHROPIC_DEFAULT_HAIKU_MODEL`. Use a lighter model than the Master — that asymmetry is the point.",
           "scope": "window"
         },
         "masterx.useClaudeCliConfig": {

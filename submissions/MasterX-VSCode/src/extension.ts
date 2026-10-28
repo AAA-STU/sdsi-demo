@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { ChatViewProvider } from './chatViewProvider';
 
 /**
- * MasterX activation: register the sidebar webview and the four commands.
+ * MasterX activation: register the panel webview and the commands.
  */
 export function activate(context: vscode.ExtensionContext): void {
   const version = context.extension.packageJSON?.version ?? '0.0.0';
@@ -36,6 +36,20 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand('masterx.showConfig', () => {
       void provider.showConfig();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('masterx.selectMasterModel', () => {
+      provider.focus();
+      void provider.pickModel('master');
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('masterx.selectWorkerModel', () => {
+      provider.focus();
+      void provider.pickModel('worker');
     })
   );
 }
